@@ -1,0 +1,18 @@
+# 忽略 __pycache__ 文件夹
+__pycache__/
+
+# 忽略所有 csv 文件
+*.csv
+
+# 忽略 operation_analysis 文件夹
+operation_analysis/
+
+# 忽略 preprocessing_analysis_plots 文件夹
+preprocessing_analysis_plots/
+
+# 忽略所有 png、jpg 图片
+*.png
+*.jpg
+
+# 忽略所有名字里包含 "test" 的文件
+*test*

@@ -535,14 +535,16 @@ class PurePythonTSProcessor:
     def process_file(self, file_path: str) -> pd.DataFrame:
         """处理单个文件并提取所有特征"""
         print(f"处理文件: {file_path}")
-        
-        # 1. 读取数据
         ts_series = self.read_data(file_path)
-        if len(ts_series) < 10:  # 过滤过短的序列
-            print(f"警告: 序列长度过短 ({len(ts_series)}), 跳过处理")
-            return None
+        return self.process_data(ts_series.values)
+    
+    def process_data(self, data: np.ndarray) -> pd.DataFrame:
+        """处理直接传入的时间序列数据"""
+        ts_series = pd.Series(data).dropna().astype(float)
+        if len(ts_series) < 10:
+            raise ValueError("时间序列长度过短，无法处理")
         
-        # 2. 提取各类特征
+        # 提取各类特征
         stat_features = self.extract_statistical_features(ts_series)
         seasonal_trend_features = self.extract_seasonal_trend_features(ts_series)
         stationarity_features = self.extract_stationarity_features(ts_series)
@@ -550,7 +552,7 @@ class PurePythonTSProcessor:
         additional_features = self.extract_additional_features(ts_series)
         catch22_features = self.extract_catch22_features(ts_series)
         
-        # 3. 合并所有特征
+        # 合并所有特征
         all_features = {
             **stat_features,** seasonal_trend_features,
             **stationarity_features,** jsd_features,
@@ -559,9 +561,6 @@ class PurePythonTSProcessor:
         
         # 转换为DataFrame
         result_df = pd.DataFrame([all_features])
-        
-        # 4. 保存结果
-        self._save_results(result_df, file_path)
         
         return result_df
 

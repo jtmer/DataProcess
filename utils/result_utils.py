@@ -4,6 +4,7 @@ import os
 import itertools
 import numpy as np
 import pandas as pd
+import re
 from .param_utils import get_params_space_and_org, get_valid_params_mode_data
 
 
@@ -584,6 +585,17 @@ def evaluate_and_save_results(
     return detailed_results
 
 
-
-
+def kwargs_to_tag(op_kwargs: dict) -> str:
+    """
+    把 kwargs 转成简短的 tag，用于文件名。
+    - 先拼接 key=val
+    - 把不适合文件名的字符替换成下划线
+    """
+    if not op_kwargs:
+        return "default"
+    parts = [f"{k}={v}" for k, v in op_kwargs.items()]
+    tag = "_".join(parts)
+    # 替换掉可能非法的字符（如空格、冒号、大括号）
+    tag = re.sub(r"[^0-9a-zA-Z._=-]+", "_", tag)
+    return tag
 

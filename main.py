@@ -17,6 +17,8 @@ from transforms import *
 
 # 搜索空间
 from utils.param_utils import get_params_space_and_org
+from utils.result_utils import kwargs_to_tag
+from feature import PurePythonTSProcessor
 
 # ========= 基本配置 =========
 parser = argparse.ArgumentParser(description="指定时序模型运行的显卡编号")
@@ -26,7 +28,7 @@ parser.add_argument("--data", type=str, required=True,
                     help="数据集名称（必填，可选值：ETTh1/ETTh2/ETTm1/ETTm2/Exchange/Weather/Electricity/Traffic）")
 args = parser.parse_args()
 
-# 修改：根据命令行参数指定DEVICE，而非固定cuda:0 👈
+# 修改：根据命令行参数指定DEVICE，而非固定cuda:0
 DEVICE =  f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
 SEED = 42
 print(f"程序将使用的设备: {DEVICE}") 
@@ -242,7 +244,7 @@ def evaluate_combo(model, dataset, cfg, split, batch_size=EVAL_BATCH_SIZE):
 
     for x_np, y_np in get_eval_batches(dataset, mode=split, batch_size=batch_size,
                                        target=TARGET_COLUMN, max_seq_len=MAX_SEQ_LEN, pred_len=PRED_LEN):
-        # 👇 每个 batch 都用它自己的数据构建处理器（关键改动）
+        # 每个 batch 都用它自己的数据构建处理器（关键改动）
         pre_fn, post_fn = build_pipeline_fns(
             cfg, dataset,
             input_data=x_np,    # for normalizer(mode='input')
@@ -263,6 +265,79 @@ def evaluate_combo(model, dataset, cfg, split, batch_size=EVAL_BATCH_SIZE):
         "smape": float(np.mean(smape_list)),
         "count_batches": len(mse_list),
     }
+
+
+# ========= 单一处理项：构造 cfg（其余为 baseline） =========
+def make_cfg_for_single_op(op_name: str, op_kwargs: dict):
+    """
+    基于 baseline（即“什么都不处理”）生成仅启用某一处理项的 cfg。
+    op_kwargs 里只填该处理项相关键即可，其它键保持 baseline。
+    """
+    used_keys, _, baseline = get_search_space()
+    cfg = dict(baseline)
+
+    # 映射：每个处理项涉及到的 cfg 键
+    op2keys = {
+        "sampler": ["sampler_factor"],
+        "trimmer": ["trimmer_seq_len"],
+        "aligner": ["aligner_mode", "aligner_method"],
+        "inputer": ["inputer_detect_method", "inputer_fill_method"],
+        "denoiser": ["denoiser_method"],
+        "warper": ["warper_method", "clip_factor"],
+        "normalizer": ["normalizer_method", "normalizer_mode", "normalizer_ratio", "clip_factor"],
+        "differentiator": ["differentiator_n", "clip_factor"],
+    }
+    if op_name not in op2keys:
+        raise ValueError(f"未知处理项: {op_name}")
+
+    # 仅更新该处理项相关键；其它键保持 baseline（=不生效）
+    for k in op2keys[op_name]:
+        if k in op_kwargs:
+            cfg[k] = op_kwargs[k]
+
+    # 只保留 used_keys 范围（防止多余键混入）
+    cfg = {k: cfg[k] for k in used_keys}
+    return cfg
+
+# ========= 取一个 batch，拿到 pre_fn，并返回处理后的数据 =========
+def get_one_processed_batch_for_op(dataset, split: str, op_name: str, op_kwargs: dict):
+    """
+    1) 基于 baseline + 单一处理项 构造 cfg
+    2) 取 split 中的第一个 batch
+    3) 用该 batch 作为 input_data/history_data 构建 pre_fn
+    4) 返回 (X_raw, X_proc, cfg) 类型：np.ndarray
+    """
+    cfg = make_cfg_for_single_op(op_name, op_kwargs)
+
+    # 取一个 batch（和你的 evaluate_combo 中一致的取数方式）
+    batch_iter = get_eval_batches(dataset, mode=split, batch_size=EVAL_BATCH_SIZE,
+                                  target=TARGET_COLUMN, max_seq_len=MAX_SEQ_LEN, pred_len=PRED_LEN)
+    X_raw, Y_dummy = next(batch_iter)  # 这里只需要 X
+
+    # 构建 pre_fn；post_fn 不用
+    pre_fn, _ = build_pipeline_fns(cfg, dataset, input_data=X_raw, history_data=X_raw)
+
+    # 应用单一处理（保持 float32，避免某些 numpy 运算升为 float64）
+    X_proc = pre_fn(X_raw.copy())
+    if X_proc.dtype != np.float32:
+        X_proc = X_proc.astype(np.float32, copy=False)
+
+    return X_raw, X_proc, cfg
+
+def iter_processed_batches_for_op_per_batch(dataset, split: str, op_name: str, op_kwargs: dict):
+    """
+    和你的 evaluate_combo 一致：对每个 batch 都单独构建一次 pre_fn，
+    这样每个 batch 的统计（如 normalizer=input/history）都会自适应该 batch。
+    """
+    cfg = make_cfg_for_single_op(op_name, op_kwargs)
+
+    for Xb, _ in get_eval_batches(dataset, mode=split, batch_size=EVAL_BATCH_SIZE,
+                                  target=TARGET_COLUMN, max_seq_len=MAX_SEQ_LEN, pred_len=PRED_LEN):
+        pre_fn, _ = build_pipeline_fns(cfg, dataset, input_data=Xb, history_data=Xb)
+        Xp = pre_fn(Xb.copy())
+        if Xp.dtype != np.float32:
+            Xp = Xp.astype(np.float32, copy=False)
+        yield Xb, Xp
     
 # ========= 主流程：在验证集上搜索最优，再到测试集对比 =========
 def main():
@@ -327,5 +402,22 @@ def main():
     logging.info(f"\nMSE 提升：{improve:.2f}%  （正数=更好）")
     print(f"\n完整搜索结果已保存: {RESULT_CSV}")
 
+
+def analysis_feature_after_proc(op_name: str, op_kwargs: dict):
+    dataset = get_dataset(DATA_NAME, fast_split=False)
+    processor = PurePythonTSProcessor()
+
+    X_raw, X_proc, cfg = get_one_processed_batch_for_op(dataset, split="val", op_name=op_name, op_kwargs=op_kwargs)
+    print(f"单一处理项 {op_name} 的 cfg：{cfg}")
+
+    # 原数据的数据特征
+    stats_raw = processor.compute_statistics(X_raw)
+    processor._save_results(stats_raw, f"single_process_analysis/{DATA_NAME}_raw.csv")
+
+    # 处理后的数据特征
+    stats_proc = processor.compute_statistics(X_proc)
+    processor._save_results(stats_proc, f"single_process_analysis/{DATA_NAME}_{kwargs_to_tag(op_kwargs)}.csv")
+
 if __name__ == "__main__":
-    main()
+    # main()
+    analysis_feature_after_proc("normalizer", {"normalizer_method":"standard","normalizer_mode":"input","normalizer_ratio":1})

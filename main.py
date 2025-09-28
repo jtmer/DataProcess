@@ -19,6 +19,7 @@ from transforms import *
 from utils.param_utils import get_params_space_and_org
 from utils.result_utils import kwargs_to_tag
 from feature import PurePythonTSProcessor
+import matplotlib.pyplot as plt
 
 # ========= 基本配置 =========
 parser = argparse.ArgumentParser(description="指定时序模型运行的显卡编号")
@@ -37,7 +38,8 @@ DATA_NAME  = args.data    # 可选：ETTh1,ETTh2,ETTm1,ETTm2,Exchange,Weather,El
 EVAL_BATCH_SIZE = 16
 
 TARGET_COLUMN = "OT"
-MAX_SEQ_LEN   = 96 * 7     # 需满足: MAX_SEQ_LEN <= train_len/2         # ! 输入长度1440
+# MAX_SEQ_LEN   = 96 * 70     # 需满足: MAX_SEQ_LEN <= train_len/2         # ! 输入长度1440
+MAX_SEQ_LEN = 15360
 PRED_LEN      = 96
 
 # 搜索控制
@@ -310,7 +312,7 @@ def get_one_processed_batch_for_op(dataset, split: str, op_name: str, op_kwargs:
     cfg = make_cfg_for_single_op(op_name, op_kwargs)
 
     # 取一个 batch（和你的 evaluate_combo 中一致的取数方式）
-    batch_iter = get_eval_batches(dataset, mode=split, batch_size=EVAL_BATCH_SIZE,
+    batch_iter = get_eval_batches(dataset, mode=split, batch_size=1,
                                   target=TARGET_COLUMN, max_seq_len=MAX_SEQ_LEN, pred_len=PRED_LEN)
     X_raw, Y_dummy = next(batch_iter)  # 这里只需要 X
 
@@ -405,19 +407,36 @@ def main():
 
 def analysis_feature_after_proc(op_name: str, op_kwargs: dict):
     dataset = get_dataset(DATA_NAME, fast_split=False)
-    processor = PurePythonTSProcessor()
+    processor = PurePythonTSProcessor(output_dir='single_process_analysis')
 
     X_raw, X_proc, cfg = get_one_processed_batch_for_op(dataset, split="val", op_name=op_name, op_kwargs=op_kwargs)
     print(f"单一处理项 {op_name} 的 cfg：{cfg}")
 
     # 原数据的数据特征
-    stats_raw = processor.compute_statistics(X_raw)
-    processor._save_results(stats_raw, f"single_process_analysis/{DATA_NAME}_raw.csv")
+    stats_raw = processor.process_data(X_raw)
+    save_raw = processor._save_results(stats_raw, f"{DATA_NAME}_raw.csv")
 
     # 处理后的数据特征
-    stats_proc = processor.compute_statistics(X_proc)
-    processor._save_results(stats_proc, f"single_process_analysis/{DATA_NAME}_{kwargs_to_tag(op_kwargs)}.csv")
+    stats_proc = processor.process_data(X_proc)
+    save_proc = processor._save_results(stats_proc, f"{DATA_NAME}_{kwargs_to_tag(op_kwargs)}.csv")
+    
+    processor.plot_key_features_bar_compare_single_row(
+        key_raw=save_raw["key_features_df"],
+        key_proc=save_proc["key_features_df"],
+        output_dir=processor.output_dir,
+        title=f"[{DATA_NAME}]Raw vs {op_name}:{kwargs_to_tag(op_kwargs)})"
+    )
+
+    # X_raw = np.squeeze(X_raw)
+    # plt.plot(range(len(X_raw)), X_raw, label='*', color='red')
+    # plt.savefig('raw.png')
+    
+    # X_proc = np.squeeze(X_proc)
+    # plt.plot(range(0, len(X_proc)), X_proc, label='-', color='green')
+    # plt.savefig('proc.png')
 
 if __name__ == "__main__":
     # main()
     analysis_feature_after_proc("normalizer", {"normalizer_method":"standard","normalizer_mode":"input","normalizer_ratio":1})
+    # analysis_feature_after_proc("sampler", {"sampler_factor":2})
+    # analysis_feature_after_proc("differentiator", {"differentiator_n":1, "clip_factor":'none'})

@@ -193,74 +193,83 @@ class PurePythonTSProcessor:
         }
 
     def extract_seasonal_trend_features(self, series: pd.Series) -> dict:
-        """提取季节性和趋势特征"""
-        series_values = series.values
-        length = len(series_values)
-        
-        # 使用FFT识别周期
-        periods, amplitude = self.fft_transfer(series_values, fmin=0)
-        
-        # 处理周期
-        periods_list = []
-        for index_j in range(min(3, len(amplitude))):
-            periods_list.append(
-                round(periods[amplitude.tolist().index(sorted(amplitude, reverse=True)[index_j])])
-            )
-        
-        # 调整周期到标准值
+        x = series.astype(float).to_numpy()
+        length = len(x)
+
+        # 清洗：去 NaN / 常数
+        if np.isnan(x).any():
+            # 简单线性插值，或直接 return 全零特征
+            x = pd.Series(x).interpolate(limit_direction="both").to_numpy()
+        if np.allclose(x.var(), 0.0):
+            return {
+                "period_1": 0, "seasonal_strength_1": 0.0, "trend_strength_1": 0.0,
+                "period_2": 0, "seasonal_strength_2": 0.0, "trend_strength_2": 0.0,
+                "period_3": 0, "seasonal_strength_3": 0.0, "trend_strength_3": 0.0,
+                "has_seasonality": False, "has_trend": False
+            }
+
+        # 1) FFT 取前3个峰（排除0频、去重）
+        periods, amp = self.fft_transfer(x, fmin=0)
+        amp = np.asarray(amp)
+        periods = np.asarray(periods)
+
+        # 排除周期<=1或无效
+        valid = periods > 1
+        periods, amp = periods[valid], amp[valid]
+
+        topk = min(3, len(amp))
+        idx = np.argsort(amp)[::-1][:topk]  # 按幅值从大到小
+        candidate_periods = [int(round(periods[i])) for i in idx]
+
+        # 2) 标准化、去重、过滤
         final_periods = []
-        for period in periods_list:
-            adjusted = self.adjust_period(period)
-            if adjusted not in final_periods and adjusted >= 4:
-                final_periods.append(adjusted)
-        
-        # 补充默认周期
-        final_periods += [p for p in DEFAULT_PERIODS if p not in final_periods]
-        
-        # 计算季节性和趋势强度
-        season_dict = {}
-        yuzhi = max(int(length / 3), 12)  # 周期阈值
-        
-        for period_value in final_periods[:3]:  # 只取前3个周期
-            if period_value < yuzhi and period_value > 0:
+        for p in candidate_periods:
+            p2 = self.adjust_period(p)
+            if p2 is not None and p2 >= 2 and p2 not in final_periods:
+                final_periods.append(p2)
+
+        # 3) 兜底默认周期
+        for p in DEFAULT_PERIODS:
+            if p not in final_periods:
+                final_periods.append(p)
+
+        # 4) STL 评估（最多取前三个）
+        yuzhi = max(int(length / 3), 12)
+        eps = 1e-12
+        records = []  # [(seasonal_strength, trend_strength, period)]
+
+        for p in final_periods[:3]:
+            if 2 <= p < min(yuzhi, length):    # 双重保护
                 try:
-                    stl = STL(series, period=period_value).fit()
-                    trend = stl.trend
-                    seasonal = stl.seasonal
-                    resid = stl.resid
-                    
-                    detrend = series_values - trend
-                    deseasonal = series_values - seasonal
-                    
-                    # 计算趋势强度和季节性强度
-                    trend_strength = max(0, 1 - (resid.var() / deseasonal.var())) if deseasonal.var() != 0 else 0
-                    seasonal_strength = max(0, 1 - (resid.var() / detrend.var())) if detrend.var() != 0 else 0
-                    
-                    season_dict[seasonal_strength] = [period_value, seasonal_strength, trend_strength]
-                except:
+                    stl = STL(series, period=p).fit()
+                    trend = stl.trend.to_numpy()
+                    seas  = stl.seasonal.to_numpy()
+                    resid = stl.resid.to_numpy()
+
+                    detrend    = x - trend
+                    deseasonal = x - seas
+
+                    ss = max(0.0, 1.0 - (np.var(resid) / (np.var(detrend) + eps)))
+                    ts = max(0.0, 1.0 - (np.var(resid) / (np.var(deseasonal) + eps)))
+                    records.append((ss, ts, p))
+                except Exception as e:
+                    # 可选择 logging.warning(f"STL failed @ period={p}: {e}")
                     continue
-        
-        # 确保至少有3个周期特征（不足的用0填充）
-        while len(season_dict) < 3:
-            season_dict[0.0] = [0, 0, 0]
-            
-        # 按季节性强度排序
-        sorted_seasons = sorted(season_dict.items(), key=lambda x: x[0], reverse=True)
-        
-        # 提取最强的三个周期特征
+
+        # 5) 不足三个则补零（不会死循环）
+        while len(records) < 3:
+            records.append((0.0, 0.0, 0))
+
+        # 6) 按季节性强度排序并组装
+        records.sort(key=lambda t: t[0], reverse=True)
         features = {}
-        for i, (_, vals) in enumerate(sorted_seasons[:3]):
-            features[f"period_{i+1}"] = vals[0]
-            features[f"seasonal_strength_{i+1}"] = vals[1]
-            features[f"trend_strength_{i+1}"] = vals[2]
-        
-        # 总体季节性和趋势判断
-        max_seasonal_strength = sorted_seasons[0][1][1] if sorted_seasons else 0
-        max_trend_strength = sorted_seasons[0][1][2] if sorted_seasons else 0
-        
-        features["has_seasonality"] = max_seasonal_strength >= 0.9
-        features["has_trend"] = max_trend_strength >= 0.85
-        
+        for i, (ss, ts, p) in enumerate(records[:3], start=1):
+            features[f"period_{i}"] = p
+            features[f"seasonal_strength_{i}"] = float(ss)
+            features[f"trend_strength_{i}"] = float(ts)
+
+        features["has_seasonality"] = records[0][0] >= 0.90
+        features["has_trend"]       = max(r[1] for r in records[:3]) >= 0.85
         return features
 
     def extract_stationarity_features(self, series: pd.Series) -> dict:
@@ -540,6 +549,8 @@ class PurePythonTSProcessor:
     
     def process_data(self, data: np.ndarray) -> pd.DataFrame:
         """处理直接传入的时间序列数据"""
+        data = np.squeeze(data)
+        
         ts_series = pd.Series(data).dropna().astype(float)
         if len(ts_series) < 10:
             raise ValueError("时间序列长度过短，无法处理")
@@ -564,7 +575,7 @@ class PurePythonTSProcessor:
         
         return result_df
 
-    def _save_results(self, result_df: pd.DataFrame, file_path: str) -> None:
+    def _save_results(self, result_df: pd.DataFrame, file_path: str) -> dict:
         """保存特征结果"""
         file_basename = os.path.splitext(os.path.basename(file_path))[0]
         
@@ -582,6 +593,76 @@ class PurePythonTSProcessor:
         key_features.to_csv(key_features_path, index=False)
         
         print(f"特征已保存至: {full_features_path} 和 {key_features_path}")
+        
+        return {
+            "full_features_path": full_features_path,
+            "key_features_path": key_features_path,
+            "key_features_df": key_features
+        }
+        
+    def _ensure_dir(self, path: str):
+        os.makedirs(path, exist_ok=True)
+
+    def plot_key_features_bar_compare_single_row(
+        self,
+        key_raw, 
+        key_proc, 
+        output_dir,
+        title="Key Features 对比 (Raw vs Proc)"
+    ):
+        """
+        针对只有一行的 key_features DataFrame：
+        在一张图上绘制所有特征的 Raw / Proc 对比柱状图，
+        并在底部标注特征名，在柱子顶端显示数值。
+        """
+        # exclude=["length", "mean", "std"]
+        exclude=["length", "mean", "std", "skewness", "kurtosis"]
+        
+        # 转换成 Series（只有一行）
+        raw_series = key_raw.iloc[0]
+        proc_series = key_proc.iloc[0]
+
+        # 公共列 & 排除指定列
+        common_cols = [c for c in raw_series.index if c in proc_series.index]
+        common_cols = [c for c in common_cols if c not in exclude]
+
+        raw_vals = raw_series[common_cols].astype(float).values
+        proc_vals = proc_series[common_cols].astype(float).values
+
+        x = np.arange(len(common_cols))
+        width = 0.4
+
+        plt.figure(figsize=(max(10, len(common_cols) * 0.6), 6))
+        bars_raw = plt.bar(x - width/2, raw_vals, width, label="Raw")
+        bars_proc = plt.bar(x + width/2, proc_vals, width, label="Proc")
+
+        # X 轴特征名
+        plt.xticks(x, common_cols, rotation=45, ha="right")
+
+        # 柱顶数值标注
+        def annotate_bars(bars):
+            for bar in bars:
+                height = bar.get_height()
+                plt.text(
+                    bar.get_x() + bar.get_width()/2, height,
+                    f"{height:.3g}",
+                    ha="center", va="bottom", fontsize=8
+                )
+        annotate_bars(bars_raw)
+        annotate_bars(bars_proc)
+
+        plt.ylabel("Value")
+        plt.title(title)
+        plt.legend()
+        plt.tight_layout()
+
+        # 保存
+        plots_dir = os.path.join(output_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+        out_path = os.path.join(plots_dir, f"{title}.png")
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+        print(f"对比图已保存：{out_path}")
 
     def _extract_key_features(self, result_df: pd.DataFrame) -> pd.DataFrame:
         """提取关键特征子集"""

@@ -594,7 +594,7 @@ def kwargs_to_tag(op_kwargs: dict) -> str:
     if not op_kwargs:
         return "default"
     parts = [f"{k}={v}" for k, v in op_kwargs.items()]
-    tag = "_".join(parts)
+    tag = "-".join(parts)
     # 替换掉可能非法的字符（如空格、冒号、大括号）
     tag = re.sub(r"[^0-9a-zA-Z._=-]+", "_", tag)
     return tag

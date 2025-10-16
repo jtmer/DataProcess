@@ -37,10 +37,9 @@ MODEL_NAME = "TimerXL"
 DATA_NAME  = args.data    # 可选：ETTh1,ETTh2,ETTm1,ETTm2,Exchange,Weather,Electricity,Traffic
 EVAL_BATCH_SIZE = 16
 
-TARGET_COLUMN = "OT"
-# MAX_SEQ_LEN   = 96 * 70     # 需满足: MAX_SEQ_LEN <= train_len/2         # ! 输入长度1440
-MAX_SEQ_LEN = 15360
-PRED_LEN      = 96
+TARGET_COLUMN   = "OT"
+MAX_SEQ_LEN     = 2880
+PRED_LEN        = 192
 
 # 搜索控制
 PRIMARY_METRIC = "mse"
@@ -58,27 +57,87 @@ def smape(y_true, y_pred, eps=1e-8):
     denom = (np.abs(y_true) + np.abs(y_pred) + eps)
     return float(200.0 * np.mean(np.abs(y_pred - y_true) / denom))
 
-# ========= 数据批生成=========
-def get_eval_batches(dataset, mode="test", batch_size=32,
-                     target=TARGET_COLUMN, max_seq_len=MAX_SEQ_LEN, pred_len=PRED_LEN):
+def get_eval_batches(dataset, mode="train", batch_size=32,
+                     target=TARGET_COLUMN, max_seq_len=MAX_SEQ_LEN, pred_len=PRED_LEN,
+                     stride: int | None = None, show_progress: bool = True):
+    """
+    生成不重叠（或按 stride 控制重叠）的时序训练样本批次。
+    - 每个样本由 (history=Xb[i], future=Yb[i]) 组成；
+    - 若 stride=None，则默认 stride=max_seq_len → 相邻窗口历史无重叠；
+    - 若 stride<max_seq_len，则历史有重叠；若 stride>max_seq_len，则存在间隔。
+
+    进度：每处理到 10%,20%,...,90% 打印一次，最后补 100%。
+    """
     assert mode in ["train", "val", "test"]
     idx_list = dataset.get_available_idx_list(mode, max_seq_len, pred_len)
-    N = len(idx_list)
-    for s in range(0, N, batch_size):
-        e = min(N, s + batch_size)
-        batch_idx = idx_list[s:e]
-        Xb = np.zeros((len(batch_idx), max_seq_len, 1), dtype=np.float32)
-        Yb = np.zeros((len(batch_idx), pred_len,    1), dtype=np.float32)
-        for i, real_idx in enumerate(batch_idx):
+    if len(idx_list) == 0:
+        if show_progress:
+            print(f"[{mode}] 无可用样本。")
+        return
+
+    # ---- 计算按 stride 采样后的 real_idx 序列 ----
+    idx_arr = np.asarray(idx_list, dtype=np.int64)
+    idx_arr.sort()
+    st = max_seq_len if stride is None else int(stride)
+
+    # 以第一个可用 real_idx 为起点，后续每次寻找 >= (prev + st) 的下一个可用 real_idx
+    selected = []
+    # 起点：用 idx_arr[0]
+    cur = idx_arr[0]
+    selected.append(cur)
+    # 目标下一个 real_idx 的下限
+    target_next = cur + st
+
+    # 用 searchsorted 在 idx_arr 上找 >= target_next 的位置
+    while True:
+        pos = np.searchsorted(idx_arr, target_next, side='left')
+        if pos >= len(idx_arr):
+            break
+        cur = idx_arr[pos]
+        selected.append(cur)
+        target_next = cur + st
+
+    Nsel = len(selected)
+    if Nsel == 0:
+        if show_progress:
+            print(f"[{mode}] 无满足 stride 的样本。")
+        return
+
+    # ---- 批量遍历与进度输出 ----
+    total_batches = (Nsel + batch_size - 1) // batch_size
+    next_report = 0.1
+    eps = 1e-12
+
+    for b, s in enumerate(range(0, Nsel, batch_size), start=1):
+        e = min(Nsel, s + batch_size)
+        batch_real_idx = selected[s:e]
+
+        Xb = np.zeros((len(batch_real_idx), max_seq_len, 1), dtype=np.float32)
+        Yb = np.zeros((len(batch_real_idx), pred_len,    1), dtype=np.float32)
+
+        for i, real_idx in enumerate(batch_real_idx):
+            # 依旧复用你原来的数据接口：其会返回长度 max_seq_len+pred_len 的拼接片段
             hwl = dataset.get_history_with_label(
-                target=target, flag=mode, real_idx=real_idx,
+                target=target, flag=mode, real_idx=int(real_idx),
                 max_seq_len=max_seq_len, pred_len=pred_len
             )
             hist = hwl[:max_seq_len].reshape(-1, 1)
             lab  = hwl[max_seq_len:].reshape(-1, 1)
             Xb[i] = hist
             Yb[i] = lab
+
+        if show_progress:
+            progress = e / float(Nsel)
+            while progress + eps >= next_report and next_report < 1.0:
+                print(f"[{mode}] 进度 {int(next_report*100)}% "
+                      f"（样本 {e}/{Nsel}，批次 {b}/{total_batches}，batch_size={batch_size}，stride={st}）")
+                next_report += 0.1
+
         yield Xb, Yb
+
+    if show_progress:
+        print(f"[{mode}] 进度 100% （样本 {Nsel}/{Nsel}，批次 {total_batches}/{total_batches}，stride={st}）")
+
 
 # ========= 模型推理=========
 @torch.no_grad()
@@ -317,14 +376,14 @@ def get_one_processed_batch_for_op(dataset, split: str, op_name: str, op_kwargs:
     X_raw, Y_dummy = next(batch_iter)  # 这里只需要 X
 
     # 构建 pre_fn；post_fn 不用
-    pre_fn, _ = build_pipeline_fns(cfg, dataset, input_data=X_raw, history_data=X_raw)
+    pre_fn, post_fn = build_pipeline_fns(cfg, dataset, input_data=X_raw, history_data=X_raw)
 
     # 应用单一处理（保持 float32，避免某些 numpy 运算升为 float64）
     X_proc = pre_fn(X_raw.copy())
     if X_proc.dtype != np.float32:
         X_proc = X_proc.astype(np.float32, copy=False)
 
-    return X_raw, X_proc, cfg
+    return X_raw, X_proc, cfg, Y_dummy, post_fn
 
 def iter_processed_batches_for_op_per_batch(dataset, split: str, op_name: str, op_kwargs: dict):
     """
@@ -333,13 +392,13 @@ def iter_processed_batches_for_op_per_batch(dataset, split: str, op_name: str, o
     """
     cfg = make_cfg_for_single_op(op_name, op_kwargs)
 
-    for Xb, _ in get_eval_batches(dataset, mode=split, batch_size=EVAL_BATCH_SIZE,
+    for Xb, y in get_eval_batches(dataset, mode=split, batch_size=1,
                                   target=TARGET_COLUMN, max_seq_len=MAX_SEQ_LEN, pred_len=PRED_LEN):
-        pre_fn, _ = build_pipeline_fns(cfg, dataset, input_data=Xb, history_data=Xb)
+        pre_fn, post_fn = build_pipeline_fns(cfg, dataset, input_data=Xb, history_data=Xb)
         Xp = pre_fn(Xb.copy())
         if Xp.dtype != np.float32:
             Xp = Xp.astype(np.float32, copy=False)
-        yield Xb, Xp
+        yield Xb, Xp, cfg, y, post_fn
     
 # ========= 主流程：在验证集上搜索最优，再到测试集对比 =========
 def main():
@@ -405,38 +464,144 @@ def main():
     print(f"\n完整搜索结果已保存: {RESULT_CSV}")
 
 
+# def analysis_feature_after_proc(op_name: str, op_kwargs: dict):
+#     dataset = get_dataset(DATA_NAME, fast_split=False)
+#     processor = PurePythonTSProcessor(output_dir='single_process_analysis')
+
+#     X_raw, X_proc, cfg, ground_truth, post_fn = get_one_processed_batch_for_op(dataset, split="train", op_name=op_name, op_kwargs=op_kwargs)
+#     print(f"单一处理项 {op_name} 的 cfg：{cfg}")
+
+#     # 原数据的数据特征
+#     stats_raw = processor.process_data(X_raw)
+#     save_raw = processor._save_results(stats_raw, f"{DATA_NAME}_raw.csv")
+
+#     # 处理后的数据特征
+#     stats_proc = processor.process_data(X_proc)
+#     save_proc = processor._save_results(stats_proc, f"{DATA_NAME}_{kwargs_to_tag(op_kwargs)}.csv")
+    
+#     processor.plot_key_features_bar_compare_single_row(
+#         key_raw=save_raw["key_features_df"],
+#         key_proc=save_proc["key_features_df"],
+#         output_dir=processor.output_dir,
+#         title=f"[{DATA_NAME}]Raw vs {op_name}:{kwargs_to_tag(op_kwargs)})"
+#     )
+    
+    
+
+#     # X_raw = np.squeeze(X_raw)
+#     # plt.plot(range(len(X_raw)), X_raw, label='*', color='red')
+#     # X_proc = np.squeeze(X_proc)
+#     # plt.plot(range(0, len(X_proc)), X_proc, label='-', color='green')
+#     # plt.savefig('proc.png')
+
+
 def analysis_feature_after_proc(op_name: str, op_kwargs: dict):
+    """
+    遍历训练集：
+      1) 对每个 batch 的 X_raw / X_proc 提取完整特征 DataFrame 并累积
+      2) 对完整特征按列求平均（numeric_only），得到单行“平均完整特征”DataFrame
+      3) 用 _save_results 保存（它会同时导出完整特征与关键特征），并用返回的 key_features_df 可视化
+      4) 分别评估 Raw / Proc 的预测（Proc 的预测需 post_fn 逆变换）并写入 txt
+    """
+    # ===== 初始化 =====
+    set_seed(SEED)
+    model = get_model(MODEL_NAME, DEVICE, args=None)
     dataset = get_dataset(DATA_NAME, fast_split=False)
     processor = PurePythonTSProcessor(output_dir='single_process_analysis')
+    os.makedirs(processor.output_dir, exist_ok=True)
 
-    X_raw, X_proc, cfg = get_one_processed_batch_for_op(dataset, split="val", op_name=op_name, op_kwargs=op_kwargs)
-    print(f"单一处理项 {op_name} 的 cfg：{cfg}")
+    # ===== 累积容器 =====
+    # 完整特征的 DataFrame 列表（逐 batch 追加，最后按列求均值）
+    full_feats_raw_list: list[pd.DataFrame] = []
+    full_feats_proc_list: list[pd.DataFrame] = []
 
-    # 原数据的数据特征
-    stats_raw = processor.process_data(X_raw)
-    save_raw = processor._save_results(stats_raw, f"{DATA_NAME}_raw.csv")
+    # 预测误差（逐 batch）
+    raw_mse_list, raw_mae_list = [], []
+    proc_mse_list, proc_mae_list = [], []
 
-    # 处理后的数据特征
-    stats_proc = processor.process_data(X_proc)
-    save_proc = processor._save_results(stats_proc, f"{DATA_NAME}_{kwargs_to_tag(op_kwargs)}.csv")
-    
-    processor.plot_key_features_bar_compare_single_row(
-        key_raw=save_raw["key_features_df"],
-        key_proc=save_proc["key_features_df"],
-        output_dir=processor.output_dir,
-        title=f"[{DATA_NAME}]Raw vs {op_name}:{kwargs_to_tag(op_kwargs)})"
-    )
+    # ===== 遍历训练集 =====
+    for Xb, Xp, cfg, yb, post_fn in iter_processed_batches_for_op_per_batch(
+        dataset, split="train", op_name=op_name, op_kwargs=op_kwargs
+    ):
+        # ---- 特征：Raw ----
+        df_raw_full = processor.process_data(Xb)         # 返回完整特征 DataFrame
+        if isinstance(df_raw_full, pd.DataFrame) and not df_raw_full.empty:
+            full_feats_raw_list.append(df_raw_full)
 
-    # X_raw = np.squeeze(X_raw)
-    # plt.plot(range(len(X_raw)), X_raw, label='*', color='red')
-    # plt.savefig('raw.png')
-    
-    # X_proc = np.squeeze(X_proc)
-    # plt.plot(range(0, len(X_proc)), X_proc, label='-', color='green')
-    # plt.savefig('proc.png')
+        # ---- 特征：Proc ----
+        df_proc_full = processor.process_data(Xp)
+        if isinstance(df_proc_full, pd.DataFrame) and not df_proc_full.empty:
+            full_feats_proc_list.append(df_proc_full)
+
+        # ---- 预测表现：Raw 输入 ----
+        y_pred_raw = model_infer(model, Xb.astype(np.float32, copy=False))
+        raw_mse_list.append(mse(yb, y_pred_raw))
+        raw_mae_list.append(mae(yb, y_pred_raw))
+
+        # ---- 预测表现：Proc 输入（预测后需逆变换）----
+        y_pred_proc = model_infer(model, Xp.astype(np.float32, copy=False))
+        y_pred_proc_restored = post_fn(y_pred_proc)
+        proc_mse_list.append(mse(yb, y_pred_proc_restored))
+        proc_mae_list.append(mae(yb, y_pred_proc_restored))
+
+    # ===== 计算“平均完整特征” =====
+    def _avg_full_features(dfs: list[pd.DataFrame]) -> pd.DataFrame:
+        if not dfs:
+            return pd.DataFrame()
+        big = pd.concat(dfs, axis=0, ignore_index=True)
+        col_means = big.mean(axis=0, numeric_only=True)
+        # 单行 DataFrame（列名为均值计算到的 numeric 列）
+        return pd.DataFrame([col_means.values], columns=col_means.index)
+
+    avg_full_raw_df  = _avg_full_features(full_feats_raw_list)
+    avg_full_proc_df = _avg_full_features(full_feats_proc_list)
+
+    # ===== 保存平均特征（_save_results 会自动另存关键特征）并可视化 =====
+    tag = kwargs_to_tag(op_kwargs) if len(op_kwargs) else "default"
+
+    # 将“平均完整特征”传入 _save_results（它会再提取 key_features 并一并保存）
+    save_raw = processor._save_results(avg_full_raw_df,  f"{DATA_NAME}_train_avg_raw.csv")
+    save_proc = processor._save_results(avg_full_proc_df, f"{DATA_NAME}_train_avg_{op_name}_{tag}.csv")
+
+    # 可视化对比：使用返回的关键特征 DataFrame
+    key_raw_df  = save_raw["key_features_df"] if isinstance(save_raw, dict) and "key_features_df" in save_raw else pd.DataFrame()
+    key_proc_df = save_proc["key_features_df"] if isinstance(save_proc, dict) and "key_features_df" in save_proc else pd.DataFrame()
+
+    if not key_raw_df.empty and not key_proc_df.empty:
+        processor.plot_key_features_bar_compare_single_row(
+            key_raw=key_raw_df,
+            key_proc=key_proc_df,
+            output_dir=processor.output_dir,
+            title=f"[{DATA_NAME}] Train Avg: Raw vs {op_name}({tag})"
+        )
+    else:
+        print("警告：关键特征为空，跳过可视化。")
+
+    # ===== 计算并保存预测指标的平均值 =====
+    raw_mse_mean  = float(np.mean(raw_mse_list))  if raw_mse_list  else float("nan")
+    raw_mae_mean  = float(np.mean(raw_mae_list))  if raw_mae_list  else float("nan")
+    proc_mse_mean = float(np.mean(proc_mse_list)) if proc_mse_list else float("nan")
+    proc_mae_mean = float(np.mean(proc_mae_list)) if proc_mae_list else float("nan")
+
+    metrics_txt = os.path.join(processor.output_dir, f"{DATA_NAME}_train_pred_metrics_{op_name}_{tag}.txt")
+    with open(metrics_txt, "w", encoding="utf-8") as f:
+        f.write(f"=== Train Split Prediction Metrics (Averaged over batches) ===\n")
+        f.write(f"Data: {DATA_NAME}\n")
+        f.write(f"Op  : {op_name} {op_kwargs}\n\n")
+        f.write(f"[Raw Input]\n")
+        f.write(f"  MSE: {raw_mse_mean:.6f}\n")
+        f.write(f"  MAE: {raw_mae_mean:.6f}\n\n")
+        f.write(f"[Processed Input]\n")
+        f.write(f"  MSE: {proc_mse_mean:.6f}\n")
+        f.write(f"  MAE: {proc_mae_mean:.6f}\n")
+
+    print(f"[Done] 平均特征与关键特征 CSV 已输出到：{processor.output_dir}")
+    print(f"[Done] 预测指标写入：{metrics_txt}")
+
+
 
 if __name__ == "__main__":
     # main()
-    analysis_feature_after_proc("normalizer", {"normalizer_method":"standard","normalizer_mode":"input","normalizer_ratio":1})
+    # analysis_feature_after_proc("normalizer", {"normalizer_method":"standard","normalizer_mode":"input","normalizer_ratio":1})
     # analysis_feature_after_proc("sampler", {"sampler_factor":2})
-    # analysis_feature_after_proc("differentiator", {"differentiator_n":1, "clip_factor":'none'})
+    analysis_feature_after_proc("differentiator", {"differentiator_n":1, "clip_factor":'none'})

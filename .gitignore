@@ -12,6 +12,8 @@ preprocessing_analysis_plots/
 
 single_process_analysis/
 
+pure_python_characteristics/
+
 # 忽略所有 png、jpg 图片
 *.png
 *.jpg

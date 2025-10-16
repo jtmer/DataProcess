@@ -615,8 +615,8 @@ class PurePythonTSProcessor:
         在一张图上绘制所有特征的 Raw / Proc 对比柱状图，
         并在底部标注特征名，在柱子顶端显示数值。
         """
-        # exclude=["length", "mean", "std"]
-        exclude=["length", "mean", "std", "skewness", "kurtosis"]
+        exclude=["length", "mean", "std"]
+        # exclude=["length", "mean", "std", "skewness", "kurtosis"]
         
         # 转换成 Series（只有一行）
         raw_series = key_raw.iloc[0]

@@ -232,7 +232,45 @@ class MyDataBase:
         self.scalers[(target, method)] = scaler
         return scaler
 
- 
+
+# class MyDataBase:
+#     column_names = ['OT']
+#     # 分开定义目标变量与其他变量
+#     def __init__(self, root_path, data_path, train_start, train_end, val_start, val_end, test_start, test_end):
+#         self.root_path = root_path
+#         self.data_path = data_path
+#         self.train_start, self.train_end = train_start, train_end
+#         self.val_start, self.val_end = val_start, val_end
+#         self.test_start, self.test_end = test_start, test_end
+#         self.train_len = self.train_end - self.train_start
+#         self.val_len = self.val_end - self.val_start
+#         self.test_len = self.test_end - self.test_start
+#         self.total_len = self.train_len + self.val_len + self.test_len
+
+#         df_raw = pd.read_csv(os.path.join(self.root_path, self.data_path))
+#         # 丢掉第一列date
+#         df_raw = df_raw.iloc[:, 1:]
+#         self.df_data = df_raw
+#         # dict: column:np.1dArray
+#         self.np_data_dict = {col: np.array(df_raw[col].values).reshape(-1) for col in df_raw.columns}
+
+#     def get_history_with_label(self, target, real_idx, max_seq_len, pred_len):
+#         return self.get_data(target, real_idx - max_seq_len, real_idx + pred_len)
+
+#     def get_data(self, target, start_idx, end_idx):
+#         assert target in self.column_names, \
+#             f'Invalid target: {target}'
+#         assert 0 <= start_idx < end_idx <= self.total_len, \
+#             f'Invalid start_idx: {start_idx}, end_idx: {end_idx}'
+#         data = self.np_data_dict[target][start_idx:end_idx]
+#         return data
+    
+#     def get_available_idx_list(self, max_seq_len):
+#         start = 0
+#         end = self.total_len - max_seq_len
+#         assert start < end, \
+#             f'Invalid start: {start}, end: {end}'
+#         return list(range(start, end))
 
 
 class EttMinute(MyDataBase):
